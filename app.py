@@ -22,6 +22,8 @@ import glob
 from pathlib import Path
 from typing import Dict, Tuple, List
 from dataclasses import dataclass
+from datetime import datetime
+from io import BytesIO
 
 import streamlit as st
 import numpy as np
@@ -30,7 +32,15 @@ import nibabel as nib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy.ndimage import zoom, label as scipy_label, binary_fill_holes, binary_erosion
+from scipy.ndimage import zoom, label as scipy_label, binary_fill_holes, binary_erosion, center_of_mass
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib.units import inch
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle, PageBreak
+from reportlab.lib import colors
 
 from monai.transforms import (
     Compose, LoadImaged, EnsureChannelFirstd, ConcatItemsd, DeleteItemsd,
@@ -189,6 +199,201 @@ def rle_decode_c_order(rle_string: str, shape: tuple = (240, 240, 155)) -> np.nd
         mask[start:start + length] = 1
 
     return mask.reshape(shape, order='C')
+
+# ============================================================================
+# PDF REPORT GENERATION - HELPER FUNCTIONS
+# ============================================================================
+
+def calculate_volumes(masks: Dict[int, np.ndarray], voxel_size_mm3: float = 1.0) -> Dict[str, Dict[str, float]]:
+    """
+    Calculate tumor volumes in mm³ and cm³.
+
+    Args:
+        masks: Dict mapping class labels to 3D mask arrays
+        voxel_size_mm3: Volume of a single voxel in mm³ (default: 1.0mm × 1.0mm × 1.0mm = 1.0mm³)
+
+    Returns:
+        Dict with volume information for each class and composite regions
+    """
+    volumes = {}
+
+    # Individual classes
+    for class_id, mask in masks.items():
+        voxel_count = mask.sum()
+        volume_mm3 = voxel_count * voxel_size_mm3
+        volume_cm3 = volume_mm3 / 1000.0
+
+        class_name = CLASS_NAMES[class_id]
+        volumes[class_name] = {
+            'voxels': int(voxel_count),
+            'mm3': float(volume_mm3),
+            'cm3': float(volume_cm3)
+        }
+
+    # Composite regions
+    # Tumor Core (TC) = Class 1 + Class 4
+    tc_mask = (masks[1] | masks[4]).astype(np.uint8)
+    tc_voxels = tc_mask.sum()
+    tc_mm3 = tc_voxels * voxel_size_mm3
+    tc_cm3 = tc_mm3 / 1000.0
+
+    volumes['Tumor Core (TC)'] = {
+        'voxels': int(tc_voxels),
+        'mm3': float(tc_mm3),
+        'cm3': float(tc_cm3)
+    }
+
+    # Whole Tumor (WT) = Class 1 + Class 2 + Class 4
+    wt_mask = (masks[1] | masks[2] | masks[4]).astype(np.uint8)
+    wt_voxels = wt_mask.sum()
+    wt_mm3 = wt_voxels * voxel_size_mm3
+    wt_cm3 = wt_mm3 / 1000.0
+
+    volumes['Whole Tumor (WT)'] = {
+        'voxels': int(wt_voxels),
+        'mm3': float(wt_mm3),
+        'cm3': float(wt_cm3)
+    }
+
+    return volumes
+
+def find_max_area_slice(masks: Dict[int, np.ndarray], axis: int) -> int:
+    """
+    Find the slice with the largest total tumor area along a given axis.
+
+    Args:
+        masks: Dict mapping class labels to 3D mask arrays
+        axis: Axis along which to slice (0=sagittal, 1=coronal, 2=axial)
+
+    Returns:
+        Index of the slice with maximum tumor area
+    """
+    # Combine all tumor classes
+    combined_mask = np.zeros_like(masks[1], dtype=np.uint8)
+    for mask in masks.values():
+        combined_mask = combined_mask | mask
+
+    # Calculate area for each slice
+    num_slices = combined_mask.shape[axis]
+    areas = []
+
+    for i in range(num_slices):
+        if axis == 0:  # Sagittal
+            slice_mask = combined_mask[i, :, :]
+        elif axis == 1:  # Coronal
+            slice_mask = combined_mask[:, i, :]
+        else:  # Axial
+            slice_mask = combined_mask[:, :, i]
+
+        areas.append(slice_mask.sum())
+
+    # Return index of slice with maximum area
+    max_idx = int(np.argmax(areas))
+    return max_idx
+
+def determine_lateralization(masks: Dict[int, np.ndarray], volume_shape: Tuple[int, int, int] = (240, 240, 155)) -> str:
+    """
+    Determine tumor lateralization based on center of mass.
+
+    Args:
+        masks: Dict mapping class labels to 3D mask arrays
+        volume_shape: Expected shape of the volume (default: 240×240×155)
+
+    Returns:
+        Lateralization string: "Left hemisphere", "Right hemisphere", or "Bilateral"
+    """
+    # Combine all tumor classes
+    combined_mask = np.zeros_like(masks[1], dtype=np.uint8)
+    for mask in masks.values():
+        combined_mask = combined_mask | mask
+
+    if combined_mask.sum() == 0:
+        return "No tumor detected"
+
+    # Calculate center of mass
+    com = center_of_mass(combined_mask)
+
+    # Midline is at x = 120 for a 240×240×155 volume
+    midline_x = volume_shape[0] / 2.0
+
+    # Get x-coordinate of center of mass
+    com_x = com[0]
+
+    # Define bilateral threshold (within 10% of volume width from midline)
+    bilateral_threshold = volume_shape[0] * 0.1
+
+    if abs(com_x - midline_x) < bilateral_threshold:
+        return "Bilateral"
+    elif com_x < midline_x:
+        return "Left hemisphere"
+    else:
+        return "Right hemisphere"
+
+def generate_clinical_summary(volumes: Dict[str, Dict[str, float]], lateralization: str, masks: Dict[int, np.ndarray]) -> str:
+    """
+    Generate automated clinical-style text summary.
+
+    Args:
+        volumes: Volume information from calculate_volumes()
+        lateralization: Lateralization string from determine_lateralization()
+        masks: Dict mapping class labels to 3D mask arrays
+
+    Returns:
+        Clinical summary text
+    """
+    summary_parts = []
+
+    # Determine dominant component
+    class_volumes = {
+        'Necrotic Core (NCR)': volumes['Necrotic Core (NCR)']['cm3'],
+        'Edema (ED)': volumes['Edema (ED)']['cm3'],
+        'Enhancing Tumor (ET)': volumes['Enhancing Tumor (ET)']['cm3']
+    }
+
+    dominant_component = max(class_volumes, key=class_volumes.get)
+
+    # Check presence of each component
+    has_necrotic = volumes['Necrotic Core (NCR)']['voxels'] > 0
+    has_edema = volumes['Edema (ED)']['voxels'] > 0
+    has_enhancing = volumes['Enhancing Tumor (ET)']['voxels'] > 0
+
+    # Build summary
+    if volumes['Whole Tumor (WT)']['voxels'] == 0:
+        summary_parts.append("No tumor detected in the analyzed MRI sequences.")
+    else:
+        # Main finding
+        wt_cm3 = volumes['Whole Tumor (WT)']['cm3']
+        tc_cm3 = volumes['Tumor Core (TC)']['cm3']
+
+        if has_enhancing:
+            et_cm3 = volumes['Enhancing Tumor (ET)']['cm3']
+            summary_parts.append(
+                f"A brain tumor was detected in the {lateralization.lower()} with an enhancing component measuring {et_cm3:.2f} cm³."
+            )
+        else:
+            summary_parts.append(
+                f"A brain tumor was detected in the {lateralization.lower()}."
+            )
+
+        # Edema
+        if has_edema:
+            ed_cm3 = volumes['Edema (ED)']['cm3']
+            if ed_cm3 > tc_cm3:
+                summary_parts.append(f"Significant peritumoral edema is present, measuring {ed_cm3:.2f} cm³.")
+            else:
+                summary_parts.append(f"Peritumoral edema is present, measuring {ed_cm3:.2f} cm³.")
+
+        # Tumor core and necrosis
+        summary_parts.append(f"The tumor core measures {tc_cm3:.2f} cm³.")
+
+        if has_necrotic:
+            ncr_cm3 = volumes['Necrotic Core (NCR)']['cm3']
+            summary_parts.append(f"A necrotic component is identified, measuring {ncr_cm3:.2f} cm³.")
+
+        # Total volume
+        summary_parts.append(f"The whole tumor volume (including all components) is {wt_cm3:.2f} cm³.")
+
+    return " ".join(summary_parts)
 
 # ============================================================================
 # POST-PROCESSING FUNCTIONS
@@ -698,6 +903,276 @@ def create_3d_visualization(image: np.ndarray, masks: Dict[int, np.ndarray],
     return fig
 
 # ============================================================================
+# PDF CLINICAL REPORT GENERATION
+# ============================================================================
+
+def create_slice_image_for_pdf(image: np.ndarray, masks: Dict[int, np.ndarray],
+                                slice_idx: int, axis: int, view_name: str) -> BytesIO:
+    """
+    Create a slice visualization and return as BytesIO for PDF embedding.
+
+    Args:
+        image: 3D image array
+        masks: Dict mapping class labels to 3D mask arrays
+        slice_idx: Index of the slice to display
+        axis: Axis along which to slice (0=sagittal, 1=coronal, 2=axial)
+        view_name: Name of the view (e.g., "Axial", "Coronal", "Sagittal")
+
+    Returns:
+        BytesIO buffer containing the PNG image
+    """
+    # Extract slice
+    if axis == 0:  # Sagittal
+        img_slice = image[slice_idx, :, :]
+        mask_slices = {k: v[slice_idx, :, :] for k, v in masks.items()}
+    elif axis == 1:  # Coronal
+        img_slice = image[:, slice_idx, :]
+        mask_slices = {k: v[:, slice_idx, :] for k, v in masks.items()}
+    else:  # Axial
+        img_slice = image[:, :, slice_idx]
+        mask_slices = {k: v[:, :, slice_idx] for k, v in masks.items()}
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=(6, 6))
+
+    # Display image
+    ax.imshow(img_slice.T, cmap='gray', origin='lower')
+
+    # Overlay masks with transparency
+    for class_id, mask_slice in mask_slices.items():
+        if mask_slice.sum() > 0:
+            # Create colored overlay
+            overlay = np.zeros((*mask_slice.shape, 4))
+            color = tuple(int(CLASS_COLORS[class_id].lstrip('#')[i:i+2], 16)/255 for i in (0, 2, 4))
+            overlay[mask_slice > 0] = (*color, 0.5)  # 50% transparency
+            ax.imshow(np.transpose(overlay, (1, 0, 2)), origin='lower')
+
+    # Add legend
+    patches = [mpatches.Patch(color=CLASS_COLORS[k], label=CLASS_NAMES[k])
+               for k in sorted(masks.keys()) if mask_slices[k].sum() > 0]
+    if patches:
+        ax.legend(handles=patches, loc='upper right', fontsize=8)
+
+    ax.set_title(f"{view_name} View (Slice {slice_idx})", fontsize=10, fontweight='bold')
+    ax.axis('off')
+
+    # Save to BytesIO
+    buf = BytesIO()
+    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    buf.seek(0)
+
+    return buf
+
+def generate_clinical_report_pdf(
+    original_image: np.ndarray,
+    masks: Dict[int, np.ndarray],
+    patient_id: str = "patient_001",
+    config: InferenceConfig = None
+) -> BytesIO:
+    """
+    Generate a comprehensive clinical report in PDF format.
+
+    Args:
+        original_image: 3D MRI image array
+        masks: Dict mapping class labels to 3D mask arrays
+        patient_id: Patient identifier
+        config: InferenceConfig object with model settings
+
+    Returns:
+        BytesIO buffer containing the PDF
+    """
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter,
+                           rightMargin=0.75*inch, leftMargin=0.75*inch,
+                           topMargin=0.75*inch, bottomMargin=0.75*inch)
+
+    # Container for the 'Flowable' objects
+    elements = []
+
+    # Define styles
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=18,
+        textColor=colors.HexColor('#1f4788'),
+        spaceAfter=12,
+        alignment=TA_CENTER,
+        fontName='Helvetica-Bold'
+    )
+
+    heading_style = ParagraphStyle(
+        'CustomHeading',
+        parent=styles['Heading2'],
+        fontSize=14,
+        textColor=colors.HexColor('#1f4788'),
+        spaceAfter=10,
+        spaceBefore=12,
+        fontName='Helvetica-Bold'
+    )
+
+    subheading_style = ParagraphStyle(
+        'CustomSubHeading',
+        parent=styles['Heading3'],
+        fontSize=11,
+        textColor=colors.HexColor('#2c5aa0'),
+        spaceAfter=8,
+        spaceBefore=8,
+        fontName='Helvetica-Bold'
+    )
+
+    normal_style = styles['Normal']
+    normal_style.fontSize = 10
+    normal_style.leading = 14
+
+    # ========== HEADER SECTION ==========
+    elements.append(Paragraph("BRAIN TUMOR SEGMENTATION REPORT", title_style))
+    elements.append(Spacer(1, 0.2*inch))
+
+    # Report metadata
+    report_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    metadata_data = [
+        ['Patient ID:', patient_id],
+        ['Report Date:', report_date],
+        ['Model:', '3D U-Net'],
+    ]
+
+    if config:
+        metadata_data.extend([
+            ['Patch Size:', f"{config.patch_size}"],
+            ['TTA Enabled:', 'Yes' if config.use_tta else 'No'],
+            ['Thresholds:', f"TC={config.threshold_tc:.2f}, WT={config.threshold_wt:.2f}, ET={config.threshold_et:.2f}"],
+        ])
+
+    metadata_table = Table(metadata_data, colWidths=[1.5*inch, 4.5*inch])
+    metadata_table.setStyle(TableStyle([
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('TEXTCOLOR', (0, 0), (0, -1), colors.HexColor('#1f4788')),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+    ]))
+
+    elements.append(metadata_table)
+    elements.append(Spacer(1, 0.3*inch))
+
+    # ========== QUANTITATIVE ANALYSIS ==========
+    elements.append(Paragraph("QUANTITATIVE ANALYSIS", heading_style))
+
+    # Calculate volumes
+    volumes = calculate_volumes(masks, voxel_size_mm3=1.0)
+
+    # Create volume table
+    volume_data = [['Region', 'Voxel Count', 'Volume (mm³)', 'Volume (cm³)']]
+
+    # Individual classes
+    for class_name in ['Necrotic Core (NCR)', 'Edema (ED)', 'Enhancing Tumor (ET)']:
+        vol_info = volumes[class_name]
+        volume_data.append([
+            class_name,
+            f"{vol_info['voxels']:,}",
+            f"{vol_info['mm3']:.2f}",
+            f"{vol_info['cm3']:.2f}"
+        ])
+
+    # Add separator
+    volume_data.append(['', '', '', ''])
+
+    # Composite regions
+    for region_name in ['Tumor Core (TC)', 'Whole Tumor (WT)']:
+        vol_info = volumes[region_name]
+        volume_data.append([
+            region_name,
+            f"{vol_info['voxels']:,}",
+            f"{vol_info['mm3']:.2f}",
+            f"{vol_info['cm3']:.2f}"
+        ])
+
+    volume_table = Table(volume_data, colWidths=[2.2*inch, 1.3*inch, 1.3*inch, 1.3*inch])
+    volume_table.setStyle(TableStyle([
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1f4788')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+        ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f0f0f0')]),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ('TOPPADDING', (0, 0), (-1, -1), 6),
+    ]))
+
+    elements.append(volume_table)
+    elements.append(Spacer(1, 0.3*inch))
+
+    # ========== CLINICAL SUMMARY ==========
+    elements.append(Paragraph("CLINICAL SUMMARY", heading_style))
+
+    # Determine lateralization
+    lateralization = determine_lateralization(masks, volume_shape=original_image.shape)
+
+    # Generate automated summary
+    clinical_text = generate_clinical_summary(volumes, lateralization, masks)
+
+    elements.append(Paragraph(f"<b>Lateralization:</b> {lateralization}", normal_style))
+    elements.append(Spacer(1, 0.1*inch))
+    elements.append(Paragraph(f"<b>Findings:</b> {clinical_text}", normal_style))
+    elements.append(Spacer(1, 0.3*inch))
+
+    # ========== PAGE BREAK ==========
+    elements.append(PageBreak())
+
+    # ========== VISUAL DOCUMENTATION ==========
+    elements.append(Paragraph("VISUAL DOCUMENTATION", heading_style))
+    elements.append(Paragraph("Representative slices showing maximum tumor extent in each anatomical plane:", normal_style))
+    elements.append(Spacer(1, 0.2*inch))
+
+    # Find max-area slices for each view
+    axial_slice = find_max_area_slice(masks, axis=2)
+    coronal_slice = find_max_area_slice(masks, axis=1)
+    sagittal_slice = find_max_area_slice(masks, axis=0)
+
+    # Create images for each view
+    views = [
+        (2, axial_slice, "Axial"),
+        (1, coronal_slice, "Coronal"),
+        (0, sagittal_slice, "Sagittal")
+    ]
+
+    for axis, slice_idx, view_name in views:
+        elements.append(Paragraph(f"{view_name} View", subheading_style))
+
+        # Create image
+        img_buf = create_slice_image_for_pdf(original_image, masks, slice_idx, axis, view_name)
+
+        # Add to PDF
+        img = Image(img_buf, width=5*inch, height=5*inch)
+        elements.append(img)
+        elements.append(Spacer(1, 0.2*inch))
+
+    # ========== FOOTER NOTE ==========
+    elements.append(Spacer(1, 0.3*inch))
+    footer_text = """
+    <b>Note:</b> This report was automatically generated using a 3D U-Net deep learning model
+    trained on the BraTS dataset. The segmentation identifies three tumor sub-regions:
+    Necrotic Core (NCR), Peritumoral Edema (ED), and Enhancing Tumor (ET).
+    This analysis is intended for research purposes and should be reviewed by a qualified radiologist
+    before clinical use.
+    """
+    elements.append(Paragraph(footer_text, normal_style))
+
+    # Build PDF
+    doc.build(elements)
+
+    buffer.seek(0)
+    return buffer
+
+# ============================================================================
 # STREAMLIT UI
 # ============================================================================
 
@@ -949,9 +1424,9 @@ def main():
                 st.plotly_chart(fig_3d, use_container_width=True)
 
         # Download section
-        st.header("💾 Download Results")
+        st.header("📥 Download Results")
 
-        download_col1, download_col2 = st.columns(2)
+        download_col1, download_col2, download_col3 = st.columns(3)
 
         with download_col1:
             st.subheader("NIfTI Format")
@@ -1011,6 +1486,32 @@ def main():
                 file_name="submission.csv",
                 mime="text/csv"
             )
+
+        with download_col3:
+            st.subheader("Clinical Report")
+
+            # Generate PDF report
+            try:
+                with st.spinner("Generating PDF report..."):
+                    pdf_buffer = generate_clinical_report_pdf(
+                        original_image=original_image,
+                        masks=masks,
+                        patient_id=patient_id,
+                        config=config
+                    )
+
+                    pdf_data = pdf_buffer.getvalue()
+
+                st.download_button(
+                    label="📄 Export Clinical Report",
+                    data=pdf_data,
+                    file_name=f"{patient_id}_clinical_report.pdf",
+                    mime="application/pdf"
+                )
+            except Exception as e:
+                st.error(f"Error generating PDF: {str(e)}")
+                import traceback
+                st.code(traceback.format_exc())
 
     # Footer
     st.markdown("---")

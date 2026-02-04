@@ -10,6 +10,7 @@ dependencies = [
     "numpy>=2.4.2",
     "pandas>=2.3.3",
     "plotly>=6.5.2",
+    "reportlab>=4.4.9",
     "scikit-image>=0.26.0",
     "scipy>=1.17.0",
     "streamlit>=1.40.0",
