@@ -553,7 +553,8 @@ def create_slice_visualization(image: np.ndarray, masks: Dict[int, np.ndarray],
             overlay = np.zeros((*mask_slice.shape, 4))
             color = tuple(int(CLASS_COLORS[class_id].lstrip('#')[i:i+2], 16)/255 for i in (0, 2, 4))
             overlay[mask_slice > 0] = (*color, 0.5)  # 50% transparency
-            ax.imshow(overlay.T, origin='lower')
+            # Transpose only spatial dimensions (0,1), keep color channel (2) last
+            ax.imshow(np.transpose(overlay, (1, 0, 2)), origin='lower')
 
     # Add legend
     patches = [mpatches.Patch(color=CLASS_COLORS[k], label=CLASS_NAMES[k])
@@ -567,24 +568,90 @@ def create_slice_visualization(image: np.ndarray, masks: Dict[int, np.ndarray],
     return fig
 
 def create_3d_visualization(image: np.ndarray, masks: Dict[int, np.ndarray],
-                           downsample_factor: int = 4):
+                           downsample_factor: int = 4, show_brain_surface: bool = True,
+                           brain_threshold: float = 0.1, brain_opacity: float = 0.15):
     """
-    Create a 3D visualization using plotly (downsampled for performance).
+    Create a 3D visualization using plotly with optional brain surface overlay.
 
     Args:
-        image: 3D image array
+        image: 3D image array (MRI modality, e.g., FLAIR)
         masks: Dict mapping class labels to 3D mask arrays
         downsample_factor: Factor by which to downsample the volume
+        show_brain_surface: Whether to show the brain surface mesh
+        brain_threshold: Threshold for brain tissue extraction (relative to max intensity)
+        brain_opacity: Opacity of the brain surface mesh (0.0-1.0)
     """
     import plotly.graph_objects as go
     from scipy.ndimage import zoom
+    from skimage.measure import marching_cubes
+    from skimage.filters import gaussian
 
     # Downsample for performance
     ds_factor = 1.0 / downsample_factor
 
     fig = go.Figure()
 
-    # Add each tumor class as a separate 3D surface
+    # Add brain surface mesh if requested
+    if show_brain_surface and image is not None:
+        try:
+            # Downsample the MRI image
+            image_ds = zoom(image, ds_factor, order=1)
+
+            # Normalize image to 0-1 range
+            img_min, img_max = image_ds.min(), image_ds.max()
+            if img_max > img_min:
+                image_norm = (image_ds - img_min) / (img_max - img_min)
+
+                # Apply Gaussian smoothing to reduce noise
+                image_smooth = gaussian(image_norm, sigma=1.0)
+
+                # Create binary mask for brain tissue
+                # Use adaptive threshold based on image statistics
+                threshold_value = brain_threshold
+                brain_mask = image_smooth > threshold_value
+
+                # Apply marching cubes to extract brain surface
+                # Use a lower level to get outer surface
+                try:
+                    verts, faces, normals, values = marching_cubes(
+                        image_smooth,
+                        level=threshold_value,
+                        step_size=2  # Further downsample the mesh for performance
+                    )
+
+                    # Create mesh trace
+                    fig.add_trace(go.Mesh3d(
+                        x=verts[:, 2],  # Swap axes to match tumor coordinates
+                        y=verts[:, 1],
+                        z=verts[:, 0],
+                        i=faces[:, 0],
+                        j=faces[:, 1],
+                        k=faces[:, 2],
+                        color='lightgray',
+                        opacity=brain_opacity,
+                        name='Brain Surface',
+                        hoverinfo='name',
+                        lighting=dict(
+                            ambient=0.5,
+                            diffuse=0.8,
+                            specular=0.2,
+                            roughness=0.5,
+                            fresnel=0.2
+                        ),
+                        lightposition=dict(
+                            x=100,
+                            y=200,
+                            z=0
+                        )
+                    ))
+                except (ValueError, RuntimeError) as e:
+                    # If marching cubes fails, silently skip brain surface
+                    pass
+        except Exception as e:
+            # If brain surface extraction fails, continue without it
+            pass
+
+    # Add each tumor class as a separate 3D scatter plot
     for class_id, mask in masks.items():
         if mask.sum() == 0:
             continue
@@ -613,12 +680,15 @@ def create_3d_visualization(image: np.ndarray, masks: Dict[int, np.ndarray],
 
     # Update layout
     fig.update_layout(
-        title="3D Tumor Segmentation Visualization",
+        title="3D Tumor Segmentation with Brain Surface",
         scene=dict(
             xaxis_title="X",
             yaxis_title="Y",
             zaxis_title="Z",
-            aspectmode='data'
+            aspectmode='data',
+            camera=dict(
+                eye=dict(x=1.5, y=1.5, z=1.5)
+            )
         ),
         width=800,
         height=800,
@@ -835,13 +905,47 @@ def main():
             st.markdown("**Interactive 3D visualization of tumor segmentation**")
             st.info("💡 Tip: Click and drag to rotate, scroll to zoom")
 
-            downsample = st.slider(
-                "Downsample Factor (higher = faster but less detailed)",
-                min_value=2, max_value=8, value=4, step=1
-            )
+            # Visualization controls
+            viz_col1, viz_col2, viz_col3 = st.columns(3)
+
+            with viz_col1:
+                downsample = st.slider(
+                    "Downsample Factor (higher = faster but less detailed)",
+                    min_value=2, max_value=8, value=4, step=1
+                )
+
+            with viz_col2:
+                show_brain = st.checkbox(
+                    "Show Brain Surface",
+                    value=True,
+                    help="Display semi-transparent brain surface mesh for anatomical context"
+                )
+
+            with viz_col3:
+                if show_brain:
+                    brain_opacity = st.slider(
+                        "Brain Opacity",
+                        min_value=0.05, max_value=0.5, value=0.15, step=0.05,
+                        help="Transparency of the brain surface (lower = more transparent)"
+                    )
+                    brain_threshold = st.slider(
+                        "Brain Threshold",
+                        min_value=0.05, max_value=0.3, value=0.1, step=0.01,
+                        help="Threshold for brain tissue extraction (adjust if brain surface is incomplete)"
+                    )
+                else:
+                    brain_opacity = 0.15
+                    brain_threshold = 0.1
 
             with st.spinner("Generating 3D visualization..."):
-                fig_3d = create_3d_visualization(original_image, masks, downsample)
+                fig_3d = create_3d_visualization(
+                    original_image,
+                    masks,
+                    downsample,
+                    show_brain_surface=show_brain,
+                    brain_threshold=brain_threshold,
+                    brain_opacity=brain_opacity
+                )
                 st.plotly_chart(fig_3d, use_container_width=True)
 
         # Download section
