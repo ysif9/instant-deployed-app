@@ -75,10 +75,10 @@ CLASS_COLORS = {1: "#FF6B6B", 2: "#4ECDC4", 4: "#FFE66D"}  # Red, Cyan, Yellow
 @dataclass
 class InferenceConfig:
     """Configuration for model inference"""
-    patch_size: Tuple[int, int, int] = (128, 128, 128)
+    patch_size: Tuple[int, int, int] = (96, 96, 96)
     in_channels: int = 4
     out_channels: int = 3
-    sw_batch_size: int = 2
+    sw_batch_size: int = 1
     overlap: float = 0.6
     use_amp: bool = True
     target_spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0)
@@ -1198,6 +1198,8 @@ def main():
 
     # Device selection
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == 'cuda':
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     st.sidebar.info(f"🖥️ Using device: **{device}**")
 
     # Advanced settings
@@ -1259,7 +1261,9 @@ def main():
 
             if model is None:
                 st.stop()
-
+            if device.type == 'cuda':
+                # Clear cached memory before starting the heavy lifting
+                torch.cuda.empty_cache()
             # Save uploaded files to temporary directory
             with tempfile.TemporaryDirectory() as tmpdir:
                 file_paths = {}
